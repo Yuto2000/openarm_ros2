@@ -289,14 +289,43 @@ hardware_interface::return_type OpenArm_v10HW::write(
 
 void OpenArm_v10HW::return_to_zero() {
   RCLCPP_INFO(rclcpp::get_logger("OpenArm_v10HW"),
-              "Returning to zero position...");
+              "Moving to home pose (slight elbow bend) over 3 seconds...");
 
-  // Return arm to zero with MIT control
-  std::vector<openarm::damiao_motor::MITParam> arm_params;
+  // Home pose: mostly zero, joint4 (elbow) slightly bent so downstream IK
+  // prefers bent-elbow solutions. Value is intentionally small (≈29°).
+  constexpr double ELBOW_BENT = 0.5;
+  const double home_pose[ARM_DOF] = {0.0, 0.0, 0.0, ELBOW_BENT, 0.0, 0.0, 0.0};
+
+  // Read current positions so we can ramp smoothly from wherever the arm is.
+  openarm_->refresh_all();
+  openarm_->recv_all();
+  const auto& motors = openarm_->get_arm().get_motors();
+  double start_pos[ARM_DOF];
   for (size_t i = 0; i < ARM_DOF; ++i) {
-    arm_params.push_back({kp_[i], kd_[i], 0.0, 0.0, 0.0});
+    start_pos[i] =
+        (i < motors.size()) ? motors[i].get_position() : 0.0;
   }
-  openarm_->get_arm().mit_control_all(arm_params);
+
+  // Linear interpolation: 300 steps × 10ms = 3s ramp.
+  constexpr int kSteps = 300;
+  constexpr int kStepMs = 10;
+  for (int step = 1; step <= kSteps; ++step) {
+    const double alpha = static_cast<double>(step) / kSteps;
+    std::vector<openarm::damiao_motor::MITParam> arm_params;
+    for (size_t i = 0; i < ARM_DOF; ++i) {
+      const double pos = start_pos[i] + alpha * (home_pose[i] - start_pos[i]);
+      arm_params.push_back({kp_[i], kd_[i], pos, 0.0, 0.0});
+    }
+    openarm_->get_arm().mit_control_all(arm_params);
+    openarm_->recv_all(500);
+    std::this_thread::sleep_for(std::chrono::milliseconds(kStepMs));
+  }
+
+  // Seed pos_commands_ with home pose so the main write() loop keeps the arm
+  // at home until a controller (e.g. forward_position_controller) overrides.
+  for (size_t i = 0; i < ARM_DOF && i < pos_commands_.size(); ++i) {
+    pos_commands_[i] = home_pose[i];
+  }
 
   // Return gripper to zero if enabled
   if (hand_) {
